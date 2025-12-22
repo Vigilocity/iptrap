@@ -132,3 +132,177 @@ impl PacketDissector {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn build_ethernet_header(ether_type: u16) -> Vec<u8> {
+        let mut header = vec![0u8; 14];
+        // dst MAC: 00:11:22:33:44:55
+        header[0..6].copy_from_slice(&[0x00, 0x11, 0x22, 0x33, 0x44, 0x55]);
+        // src MAC: 66:77:88:99:aa:bb
+        header[6..12].copy_from_slice(&[0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb]);
+        // EtherType (big-endian)
+        header[12..14].copy_from_slice(&ether_type.to_be_bytes());
+        header
+    }
+
+    fn build_ip_header(src: [u8; 4], dst: [u8; 4], protocol: u8, total_len: u16) -> Vec<u8> {
+        let mut header = vec![0u8; 20];
+        header[0] = 0x45; // Version 4, IHL 5 (20 bytes)
+        header[1] = 0x00; // TOS
+        header[2..4].copy_from_slice(&total_len.to_be_bytes()); // Total length
+        header[4..6].copy_from_slice(&[0x00, 0x01]); // ID
+        header[6..8].copy_from_slice(&[0x00, 0x00]); // Flags + Fragment offset
+        header[8] = 64; // TTL
+        header[9] = protocol; // Protocol
+        header[10..12].copy_from_slice(&[0x00, 0x00]); // Checksum (not validated)
+        header[12..16].copy_from_slice(&src); // Source IP
+        header[16..20].copy_from_slice(&dst); // Dest IP
+        header
+    }
+
+    fn build_tcp_header(src_port: u16, dst_port: u16, flags: u8) -> Vec<u8> {
+        let mut header = vec![0u8; 20];
+        header[0..2].copy_from_slice(&src_port.to_be_bytes()); // Source port
+        header[2..4].copy_from_slice(&dst_port.to_be_bytes()); // Dest port
+        header[4..8].copy_from_slice(&[0x00, 0x00, 0x00, 0x01]); // Seq
+        header[8..12].copy_from_slice(&[0x00, 0x00, 0x00, 0x00]); // Ack
+        header[12] = 0x50; // Data offset: 5 (20 bytes), no options
+        header[13] = flags; // Flags
+        header[14..16].copy_from_slice(&[0xff, 0xff]); // Window
+        header[16..18].copy_from_slice(&[0x00, 0x00]); // Checksum
+        header[18..20].copy_from_slice(&[0x00, 0x00]); // Urgent pointer
+        header
+    }
+
+    fn build_test_packet(local_ip: [u8; 4], src_ip: [u8; 4], dst_port: u16, payload: &[u8]) -> Vec<u8> {
+        let tcp_len = 20 + payload.len();
+        let ip_total_len = 20 + tcp_len;
+
+        let mut packet = build_ethernet_header(ETHERTYPE_IP);
+        packet.extend(build_ip_header(src_ip, local_ip, IPPROTO_TCP, ip_total_len as u16));
+        packet.extend(build_tcp_header(54321, dst_port, TH_ACK));
+        packet.extend(payload);
+        packet
+    }
+
+    #[test]
+    fn test_valid_packet_with_payload() {
+        let local_ip = vec![10, 0, 0, 1];
+        let filter = PacketDissectorFilter::new(local_ip.clone());
+        let payload = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let packet = build_test_packet([10, 0, 0, 1], [192, 168, 1, 100], 80, payload);
+
+        let dissector = PacketDissector::new(&filter, packet).expect("Should parse valid packet");
+
+        assert_eq!(dissector.tcp_data, payload.to_vec());
+        let tcphdr = unsafe { &*dissector.tcphdr_ptr };
+        assert_eq!(u16::from_be(tcphdr.th_dport), 80);
+        assert_eq!(u16::from_be(tcphdr.th_sport), 54321);
+    }
+
+    #[test]
+    fn test_empty_payload() {
+        let local_ip = vec![10, 0, 0, 1];
+        let filter = PacketDissectorFilter::new(local_ip);
+        let packet = build_test_packet([10, 0, 0, 1], [192, 168, 1, 100], 443, &[]);
+
+        let dissector = PacketDissector::new(&filter, packet).expect("Should parse packet with empty payload");
+
+        assert!(dissector.tcp_data.is_empty());
+    }
+
+    #[test]
+    fn test_binary_payload() {
+        let local_ip = vec![10, 0, 0, 1];
+        let filter = PacketDissectorFilter::new(local_ip);
+        // TLS Client Hello starts with 0x16 0x03
+        let payload: Vec<u8> = vec![0x16, 0x03, 0x01, 0x00, 0x05, 0x01, 0x00, 0x00, 0x01, 0x00];
+        let packet = build_test_packet([10, 0, 0, 1], [192, 168, 1, 100], 443, &payload);
+
+        let dissector = PacketDissector::new(&filter, packet).expect("Should parse binary payload");
+
+        assert_eq!(dissector.tcp_data, payload);
+    }
+
+    #[test]
+    fn test_wrong_destination_ip() {
+        let local_ip = vec![10, 0, 0, 1];
+        let filter = PacketDissectorFilter::new(local_ip);
+        // Packet destined for different IP
+        let packet = build_test_packet([10, 0, 0, 2], [192, 168, 1, 100], 80, b"test");
+
+        let result = PacketDissector::new(&filter, packet);
+
+        assert!(result.is_err());
+        assert_eq!(result.err().unwrap(), "Packet destination is not the local IP");
+    }
+
+    #[test]
+    fn test_non_ip_ethertype() {
+        let local_ip = vec![10, 0, 0, 1];
+        let filter = PacketDissectorFilter::new(local_ip);
+        let packet = build_ethernet_header(0x86DD); // IPv6
+
+        let result = PacketDissector::new(&filter, packet);
+
+        assert!(result.is_err());
+        assert_eq!(result.err().unwrap(), "Unsupported type of ethernet frame");
+    }
+
+    #[test]
+    fn test_non_tcp_protocol() {
+        let local_ip = vec![10, 0, 0, 1];
+        let filter = PacketDissectorFilter::new(local_ip);
+
+        let mut packet = build_ethernet_header(ETHERTYPE_IP);
+        packet.extend(build_ip_header([192, 168, 1, 100], [10, 0, 0, 1], 17, 28)); // UDP (17)
+
+        let result = PacketDissector::new(&filter, packet);
+
+        assert!(result.is_err());
+        assert_eq!(result.err().unwrap(), "Unsupported IP protocol");
+    }
+
+    #[test]
+    fn test_short_ethernet_frame() {
+        let local_ip = vec![10, 0, 0, 1];
+        let filter = PacketDissectorFilter::new(local_ip);
+        let packet = vec![0u8; 10]; // Too short
+
+        let result = PacketDissector::new(&filter, packet);
+
+        assert!(result.is_err());
+        assert_eq!(result.err().unwrap(), "Short ethernet frame");
+    }
+
+    #[test]
+    fn test_short_ip_packet() {
+        let local_ip = vec![10, 0, 0, 1];
+        let filter = PacketDissectorFilter::new(local_ip);
+        let mut packet = build_ethernet_header(ETHERTYPE_IP);
+        packet.extend(vec![0u8; 10]); // Short IP header
+
+        let result = PacketDissector::new(&filter, packet);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_tcp_flags_preserved() {
+        let local_ip = vec![10, 0, 0, 1];
+        let filter = PacketDissectorFilter::new(local_ip.clone());
+
+        let ip_total_len = 20 + 20; // IP header + TCP header, no payload
+        let mut packet = build_ethernet_header(ETHERTYPE_IP);
+        packet.extend(build_ip_header([192, 168, 1, 100], [10, 0, 0, 1], IPPROTO_TCP, ip_total_len as u16));
+        packet.extend(build_tcp_header(54321, 443, TH_SYN | TH_ACK));
+
+        let dissector = PacketDissector::new(&filter, packet).expect("Should parse");
+        let tcphdr = unsafe { &*dissector.tcphdr_ptr };
+
+        assert_eq!(tcphdr.th_flags, TH_SYN | TH_ACK);
+    }
+}
