@@ -9,8 +9,8 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 use std::thread;
 
+use base64::{Engine as _, engine::general_purpose};
 use iptrap::privilegesdrop;
-use iptrap::strsliceescape::StrSliceEscape;
 use iptrap::EmptyTcpPacket;
 use iptrap::ETHERTYPE_IP;
 use iptrap::{checksum, cookie};
@@ -116,19 +116,21 @@ fn log_tcp_ack(
             return false;
         }
     }
-    let tcp_data_str = String::from_utf8_lossy(&dissector.tcp_data).into_owned();
+    let payload_b64 = general_purpose::STANDARD.encode(&dissector.tcp_data);
     let ip_src = s_iphdr.ip_src;
     let dport = u16::from_be(s_tcphdr.th_dport);
-    let mut record: HashMap<String, Json> = HashMap::with_capacity(4);
+    let th_flags = s_tcphdr.th_flags;
+    let mut record: HashMap<String, Json> = HashMap::with_capacity(5);
     record.insert("ts".to_owned(), Json::U64(ts));
     record.insert(
         "ip_src".to_owned(),
         Json::String(format!("{}.{}.{}.{}", ip_src[0], ip_src[1], ip_src[2], ip_src[3]).to_owned()),
     );
     record.insert("dport".to_owned(), Json::U64(dport as u64));
+    record.insert("tcp_flags".to_owned(), Json::U64(th_flags as u64));
     record.insert(
         "payload".to_owned(),
-        Json::String(tcp_data_str.escape_default_except_lf().to_owned()),
+        Json::String(payload_b64),
     );
     let json = record.to_json().to_string();
     let _ = zmq_ctx.send(json.as_bytes(), 0);
