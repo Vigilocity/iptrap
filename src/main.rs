@@ -118,15 +118,19 @@ fn log_tcp_ack(
     }
     let payload_b64 = general_purpose::STANDARD.encode(&dissector.tcp_data);
     let ip_src = s_iphdr.ip_src;
+    let sport = u16::from_be(s_tcphdr.th_sport);
     let dport = u16::from_be(s_tcphdr.th_dport);
+    let seq = u32::from_be(s_tcphdr.th_seq);
     let th_flags = s_tcphdr.th_flags;
-    let mut record: HashMap<String, Json> = HashMap::with_capacity(5);
+    let mut record: HashMap<String, Json> = HashMap::with_capacity(7);
     record.insert("ts".to_owned(), Json::U64(ts));
     record.insert(
         "ip_src".to_owned(),
         Json::String(format!("{}.{}.{}.{}", ip_src[0], ip_src[1], ip_src[2], ip_src[3]).to_owned()),
     );
+    record.insert("sport".to_owned(), Json::U64(sport as u64));
     record.insert("dport".to_owned(), Json::U64(dport as u64));
+    record.insert("seq".to_owned(), Json::U64(seq as u64));
     record.insert("tcp_flags".to_owned(), Json::U64(th_flags as u64));
     record.insert(
         "payload".to_owned(),
